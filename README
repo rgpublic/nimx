@@ -1,0 +1,20 @@
+Nim Script Loader written in C++
+
+Compile with:
+
+g++ -o nimx nimx.cpp
+
+Use with e.g. this she-bang:
+
+#!/usr/local/bin/nimx
+
+* Better than using restricted NimScript - you can use the full Nim command set
+* No complicated she-bang line with unnecessary arguments
+* Caches compiled files in  ~/.nimx - not clobbering your script folder
+* Uses stdin piping to allow all characters in the filename. Standard nim doesn't allow dash ("-") for example.
+
+I'd recommend you also checkout these and see what you like best:
+
+* https://github.com/flaviut/nimrun
+* https://github.com/Jeff-Ciesielski/nimr
+
