@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <sstream>
@@ -26,6 +27,31 @@ std::string sanitize_identifier(const std::string &raw) {
         out = "m_" + out;
     }
     return out;
+}
+
+// Runs a command to completion (fork + exec + wait) and returns its exit
+// code, or -1 if it could not even be started/waited on.
+int run_and_wait(const std::vector<std::string> &args) {
+    std::vector<char *> cargs;
+    cargs.reserve(args.size() + 1);
+    for (auto &a : args) {
+        cargs.push_back(const_cast<char *>(a.c_str()));
+    }
+    cargs.push_back(nullptr);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        std::cerr << "nimx: fork failed: " << std::strerror(errno) << "\n";
+        return -1;
+    }
+    if (pid == 0) {
+        execvp(cargs[0], cargs.data());
+        std::cerr << "nimx: failed to exec " << args[0] << ": " << std::strerror(errno) << "\n";
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 int main(int argc, char **argv) {
@@ -66,69 +92,114 @@ int main(int argc, char **argv) {
     // the script itself under a sanitized, valid module name. Compiling
     // that symlink gives Nim a valid identifier while every relative path
     // inside the script still resolves through to the real files.
-    const std::filesystem::path shadow_dir = std::filesystem::path(cache_dir) / (module_name + "_env");
-    try {
-        if (std::filesystem::exists(shadow_dir)) {
-            std::filesystem::remove_all(shadow_dir);
-        }
-        std::filesystem::create_directories(shadow_dir);
-        for (const auto &entry : std::filesystem::directory_iterator(original_dir)) {
-            if (entry.path().filename() == script_path.filename()) {
-                continue; // handled separately below, under the sanitized name
-            }
-            std::filesystem::create_symlink(entry.path(), shadow_dir / entry.path().filename());
-        }
-        // The entry point must be a real file, not a symlink: nim resolves
-        // symlinks back to the real path when deriving the module name,
-        // which would just reintroduce the original invalid-identifier error.
-        std::filesystem::copy_file(script_path, shadow_dir / (module_name + ".nim"),
-                                    std::filesystem::copy_options::overwrite_existing);
-    } catch (const std::filesystem::filesystem_error &e) {
-        std::cerr << "nimx: failed to stage script environment: " << e.what() << "\n";
-        return 1;
-    }
-
-    const std::filesystem::path compile_path = shadow_dir / (module_name + ".nim");
     const std::filesystem::path binary_path = std::filesystem::path(cache_dir) / module_name;
+    const std::filesystem::path deps_path = std::filesystem::path(cache_dir) / (module_name + ".deps");
 
-    // Compile only (nim c), not nim r: "nim r" runs the binary itself as a
-    // monitored subprocess and wraps abnormal exits (including Ctrl-C)
-    // with its own "execution of an external program failed" message.
-    // Compiling separately and exec'ing the binary ourselves below means
-    // the binary owns the terminal directly, so Ctrl-C produces Nim's own
-    // clean SIGINT traceback instead.
-    std::vector<std::string> compile_args = {
-        "nim",
-        "c",
-        "--hints:off",
-        "--warnings:off",
-        "-d:release",
-        "--nimcache:" + cache_dir,
-        "--path:" + original_dir.string(),
-        "-o:" + binary_path.string(),
-        compile_path.string(),
-    };
-    std::vector<char *> compile_cargs;
-    compile_cargs.reserve(compile_args.size() + 1);
-    for (auto &a : compile_args) {
-        compile_cargs.push_back(a.data());
+    // Fast path: nim's --genScript:on writes a ".deps" file listing every
+    // file the compile actually touched (the script itself, anything it
+    // includes/imports, and stdlib modules). If the cached binary is newer
+    // than everything in that list - and newer than the real script file,
+    // since the .deps entry for it points at the shadow copy below, not
+    // the original - skip invoking nim entirely. This avoids scanning
+    // every unrelated file that happens to sit in the same directory.
+    bool need_build = true;
+    if (std::filesystem::exists(binary_path) && std::filesystem::exists(deps_path)) {
+        try {
+            auto binary_time = std::filesystem::last_write_time(binary_path);
+            bool any_newer = std::filesystem::last_write_time(script_path) > binary_time;
+            if (!any_newer) {
+                std::ifstream deps_file(deps_path);
+                std::string line;
+                while (std::getline(deps_file, line)) {
+                    if (line.empty()) {
+                        continue;
+                    }
+                    if (!std::filesystem::exists(line) ||
+                        std::filesystem::last_write_time(line) > binary_time) {
+                        any_newer = true;
+                        break;
+                    }
+                }
+            }
+            need_build = any_newer;
+        } catch (const std::filesystem::filesystem_error &) {
+            need_build = true; // if we can't tell, be safe and rebuild
+        }
     }
-    compile_cargs.push_back(nullptr);
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        std::cerr << "nimx: fork failed: " << std::strerror(errno) << "\n";
-        return 1;
-    }
-    if (pid == 0) {
-        execvp("nim", compile_cargs.data());
-        std::cerr << "nimx: failed to exec nim: " << std::strerror(errno) << "\n";
-        _exit(127);
-    }
-    int status = 0;
-    waitpid(pid, &status, 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    if (need_build) {
+        const std::filesystem::path shadow_dir = std::filesystem::path(cache_dir) / (module_name + "_env");
+        const std::filesystem::path entry_path = shadow_dir / (module_name + ".nim");
+        try {
+            if (!std::filesystem::exists(shadow_dir)) {
+                std::filesystem::create_directories(shadow_dir);
+            } else {
+                // Refresh sibling symlinks (cheap, and doesn't touch target
+                // mtimes) so added/removed files are picked up.
+                for (const auto &existing : std::filesystem::directory_iterator(shadow_dir)) {
+                    if (std::filesystem::is_symlink(existing)) {
+                        std::filesystem::remove(existing);
+                    }
+                }
+            }
+            for (const auto &entry : std::filesystem::directory_iterator(original_dir)) {
+                if (entry.path().filename() == script_path.filename()) {
+                    continue; // handled separately below, under the sanitized name
+                }
+                std::filesystem::create_symlink(entry.path(), shadow_dir / entry.path().filename());
+            }
+            // The entry point must be a real file, not a symlink: nim
+            // resolves symlinks back to the real path when deriving the
+            // module name, which would reintroduce the invalid-identifier
+            // error.
+            std::filesystem::copy_file(script_path, entry_path,
+                                        std::filesystem::copy_options::overwrite_existing);
+        } catch (const std::filesystem::filesystem_error &e) {
+            std::cerr << "nimx: failed to stage script environment: " << e.what() << "\n";
+            return 1;
+        }
+
+        // Compile only (nim c), not nim r: "nim r" runs the binary itself
+        // as a monitored subprocess and wraps abnormal exits (including
+        // Ctrl-C) with its own "execution of an external program failed"
+        // message. Compiling separately and exec'ing the binary ourselves
+        // below means the binary owns the terminal directly, so Ctrl-C
+        // produces nim's own clean SIGINT traceback instead.
+        // Two passes: --genScript:on (needed to get the .deps file used by
+        // the fast path above) implies --compileOnly, so it can't produce
+        // a runnable binary in the same invocation. Pass 1 does the real
+        // compile+link; pass 2 reuses the now-warm cache to cheaply emit
+        // an up to date .deps file for next time.
+        std::vector<std::string> compile_args = {
+            "nim",
+            "c",
+            "--hints:off",
+            "--warnings:off",
+            "-d:release",
+            "--nimcache:" + cache_dir,
+            "--path:" + original_dir.string(),
+            "-o:" + binary_path.string(),
+            entry_path.string(),
+        };
+        std::vector<std::string> depscript_args = {
+            "nim",
+            "c",
+            "--hints:off",
+            "--warnings:off",
+            "-d:release",
+            "--genScript:on",
+            "--nimcache:" + cache_dir,
+            "--path:" + original_dir.string(),
+            entry_path.string(),
+        };
+        int compile_status = run_and_wait(compile_args);
+        if (compile_status != 0) {
+            return compile_status < 0 ? 1 : compile_status;
+        }
+        // Best-effort: if this fails, we simply won't have a .deps file,
+        // so the next run's fast-path check treats it as "must rebuild"
+        // rather than silently trusting a stale binary.
+        run_and_wait(depscript_args);
     }
 
     // Compile succeeded; hand off the terminal to the binary directly.
