@@ -6,6 +6,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -88,32 +89,63 @@ int main(int argc, char **argv) {
     }
 
     const std::filesystem::path compile_path = shadow_dir / (module_name + ".nim");
+    const std::filesystem::path binary_path = std::filesystem::path(cache_dir) / module_name;
 
-    // Build: nim r --hints:off --warnings:off -d:release --nimcache:<dir> --path:<original dir> <shadow entry> <args...>
-    std::vector<std::string> args = {
+    // Compile only (nim c), not nim r: "nim r" runs the binary itself as a
+    // monitored subprocess and wraps abnormal exits (including Ctrl-C)
+    // with its own "execution of an external program failed" message.
+    // Compiling separately and exec'ing the binary ourselves below means
+    // the binary owns the terminal directly, so Ctrl-C produces Nim's own
+    // clean SIGINT traceback instead.
+    std::vector<std::string> compile_args = {
         "nim",
-        "r",
+        "c",
         "--hints:off",
         "--warnings:off",
         "-d:release",
         "--nimcache:" + cache_dir,
         "--path:" + original_dir.string(),
+        "-o:" + binary_path.string(),
         compile_path.string(),
     };
+    std::vector<char *> compile_cargs;
+    compile_cargs.reserve(compile_args.size() + 1);
+    for (auto &a : compile_args) {
+        compile_cargs.push_back(a.data());
+    }
+    compile_cargs.push_back(nullptr);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        std::cerr << "nimx: fork failed: " << std::strerror(errno) << "\n";
+        return 1;
+    }
+    if (pid == 0) {
+        execvp("nim", compile_cargs.data());
+        std::cerr << "nimx: failed to exec nim: " << std::strerror(errno) << "\n";
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    }
+
+    // Compile succeeded; hand off the terminal to the binary directly.
+    std::vector<std::string> run_args = {binary_path.string()};
     for (int i = 2; i < argc; ++i) {
-        args.emplace_back(argv[i]);
+        run_args.emplace_back(argv[i]);
     }
-
-    std::vector<char *> cargs;
-    cargs.reserve(args.size() + 1);
-    for (auto &a : args) {
-        cargs.push_back(a.data());
+    std::vector<char *> run_cargs;
+    run_cargs.reserve(run_args.size() + 1);
+    for (auto &a : run_args) {
+        run_cargs.push_back(a.data());
     }
-    cargs.push_back(nullptr);
+    run_cargs.push_back(nullptr);
 
-    execvp("nim", cargs.data());
+    execvp(binary_path.c_str(), run_cargs.data());
 
     // Only reached if execvp failed
-    std::cerr << "nimx: failed to exec nim: " << std::strerror(errno) << "\n";
+    std::cerr << "nimx: failed to exec compiled binary: " << std::strerror(errno) << "\n";
     return 1;
 }
