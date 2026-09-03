@@ -175,6 +175,7 @@ int main(int argc, char **argv) {
             "c",
             "--hints:off",
             "--warnings:off",
+            "-d:ssl",
             "-d:release",
             "-d:self:" + script_path.string(),
             "--nimcache:" + cache_dir,
